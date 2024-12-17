@@ -51,29 +51,33 @@ const auto rollout_doc = R"(
 Roll out batch of trajectories from initial states, get resulting states and sensor values.
 
   input arguments (required):
-    model              list of homogenous MjModel instances of length nbatch
-    data               list of compatible MjData instances of length nthread
+    model              list of MjModel instances of length ndomains
+    data               list of associated MjData instances of length nthread
+    ndomain            integer, number of domains
     nstep              integer, number of steps to be taken for each trajectory
     control_spec       specification of controls, ncontrol = mj_stateSize(m, control_spec)
     state0             (nbatch x nstate) nbatch initial state arrays, where
                            nstate = mj_stateSize(m, mjSTATE_FULLPHYSICS)
   input arguments (optional):
     warmstart0         (nbatch x nv)                  nbatch qacc_warmstart arrays
+    control0           (nbatch x ncontrol)            nbatch initial control vectors
     control            (nbatch x nstep x ncontrol)    nbatch trajectories of nstep controls
+    chunk_size         integer, determines threadpool chunk size. If unspecified, the default is
+                           chunk_size = max(1, nbatch / (nthread * 10))
+    nrepeat            integer, number of sub-steps (mj_step) to be taken for each action
+
   output arguments (optional):
     state              (nbatch x nstep x nstate)      nbatch nstep states
     sensordata         (nbatch x nstep x nsendordata) nbatch trajectories of nstep sensordata arrays
-    chunk_size         integer, determines threadpool chunk size. If unspecified, the default is
-                           chunk_size = max(1, nbatch / (nthread * 10))
+    warmstart          (nbatch x nstep x nv)           nbatch nstep qacc_warmstart vectors (useful for perfect reproducibility)
 )";
 
 // C-style rollout function, assumes all arguments are valid
 // all input fields of d are initialised, contents at call time do not matter
 // after returning, d will contain the last step of the last rollout
-void _unsafe_rollout(std::vector<const mjModel*>& m, mjData* d, int start_roll,
-                     int end_roll, int nstep, unsigned int control_spec,
-                     const mjtNum* state0, const mjtNum* warmstart0,
-                     const mjtNum* control, mjtNum* state, mjtNum* sensordata) {
+void _unsafe_rollout(std::vector<const mjModel*>& m, mjData* d, int start_roll, int end_roll, int nstep, unsigned int control_spec,
+                     const mjtNum* state0, const mjtNum* warmstart0, const mjtNum* control0, const mjtNum* control,
+                     mjtNum* state, mjtNum* sensordata, mjtNum* warmstart, int nrepeat, int ndomain) {
   // sizes
   size_t nstate = static_cast<size_t>(mj_stateSize(m[0], mjSTATE_FULLPHYSICS));
   size_t ncontrol = static_cast<size_t>(mj_stateSize(m[0], control_spec));
@@ -93,28 +97,32 @@ void _unsafe_rollout(std::vector<const mjModel*>& m, mjData* d, int start_roll,
   }
 
   // loop over rollouts
-  for (size_t r = start_roll; r < end_roll; r++) {
+  for (int r = start_roll; r < end_roll; r++) {
+    int r_m = r % ndomain;
     // clear user inputs if unspecified
     if (!(control_spec & mjSTATE_MOCAP_POS)) {
       for (int i = 0; i < nbody; i++) {
-        int id = m[r]->body_mocapid[i];
-        if (id >= 0) mju_copy3(d->mocap_pos+3*id, m[r]->body_pos+3*i);
+        int id = m[r_m]->body_mocapid[i];
+        if (id >= 0) mju_copy3(d->mocap_pos+3*id, m[r_m]->body_pos+3*i);
       }
     }
     if (!(control_spec & mjSTATE_MOCAP_QUAT)) {
       for (int i = 0; i < nbody; i++) {
-        int id = m[r]->body_mocapid[i];
-        if (id >= 0) mju_copy4(d->mocap_quat+4*id, m[r]->body_quat+4*i);
+        int id = m[r_m]->body_mocapid[i];
+        if (id >= 0) mju_copy4(d->mocap_quat+4*id, m[r_m]->body_quat+4*i);
       }
     }
     if (!(control_spec & mjSTATE_EQ_ACTIVE)) {
       for (int i = 0; i < neq; i++) {
-        d->eq_active[i] = m[r]->eq_active0[i];
+        d->eq_active[i] = m[r_m]->eq_active0[i];
       }
     }
 
     // set initial state
-    mj_setState(m[r], d, state0 + r*nstate, mjSTATE_FULLPHYSICS);
+    mj_setState(m[r_m], d, state0 + r*nstate, mjSTATE_FULLPHYSICS);
+    if (control0) {
+      mj_setState(m[r_m], d, control0 + r*ncontrol, control_spec);
+    }
 
     // set warmstart accelerations
     if (warmstart0) {
@@ -144,10 +152,13 @@ void _unsafe_rollout(std::vector<const mjModel*>& m, mjData* d, int start_roll,
         for (; t < nstep; t++) {
           size_t step = r*static_cast<size_t>(nstep) + t;
           if (state) {
-            mj_getState(m[r], d, state + step*nstate, mjSTATE_FULLPHYSICS);
+            mj_getState(m[r_m], d, state + step*nstate, mjSTATE_FULLPHYSICS);
           }
           if (sensordata) {
             mju_copy(sensordata + step*nsensordata, d->sensordata, nsensordata);
+          }
+          if (warmstart) {
+            mju_copy(warmstart + step*nv, d->qacc_warmstart, nv);
           }
         }
         break;
@@ -157,20 +168,26 @@ void _unsafe_rollout(std::vector<const mjModel*>& m, mjData* d, int start_roll,
 
       // controls
       if (control) {
-        mj_setState(m[r], d, control + step*ncontrol, control_spec);
+        mj_setState(m[r_m], d, control + step*ncontrol, control_spec);
       }
 
       // step
-      mj_step(m[r], d);
+      for (int j = 0; j < nrepeat; ++j) {
+        mj_step(m[r_m], d);
+      }
 
       // copy out new state
       if (state) {
-        mj_getState(m[r], d, state + step*nstate, mjSTATE_FULLPHYSICS);
+        mj_getState(m[r_m], d, state + step*nstate, mjSTATE_FULLPHYSICS);
       }
 
       // copy out sensor values
       if (sensordata) {
         mju_copy(sensordata + step*nsensordata, d->sensordata, nsensordata);
+      }
+
+      if (warmstart) {
+        mju_copy(warmstart + step*nv, d->qacc_warmstart, nv);
       }
     }
   }
@@ -179,9 +196,9 @@ void _unsafe_rollout(std::vector<const mjModel*>& m, mjData* d, int start_roll,
 // C-style threaded version of _unsafe_rollout
 void _unsafe_rollout_threaded(std::vector<const mjModel*>& m, std::vector<mjData*>& d,
                               int nbatch, int nstep, unsigned int control_spec,
-                              const mjtNum* state0, const mjtNum* warmstart0,
-                              const mjtNum* control, mjtNum* state, mjtNum* sensordata,
-                              ThreadPool* pool, int chunk_size) {
+                              const mjtNum* state0, const mjtNum* warmstart0, const mjtNum* control0,
+                              const mjtNum* control, mjtNum* state, mjtNum* sensordata, mjtNum* warmstart,
+                              ThreadPool* pool, int chunk_size, int nrepeat, int ndomain) {
   int nfulljobs = nbatch / chunk_size;
   int chunk_remainder = nbatch % chunk_size;
   int njobs = (chunk_remainder > 0) ? nfulljobs + 1 : nfulljobs;
@@ -194,7 +211,7 @@ void _unsafe_rollout_threaded(std::vector<const mjModel*>& m, std::vector<mjData
     auto task = [=, &m, &d](void) {
       int id = pool->WorkerId();
       _unsafe_rollout(m, d[id], j*chunk_size, (j+1)*chunk_size,
-        nstep, control_spec, state0, warmstart0, control, state, sensordata);
+        nstep, control_spec, state0, warmstart0, control0, control, state, sensordata, warmstart, nrepeat, ndomain);
     };
     pool->Schedule(task);
   }
@@ -204,7 +221,7 @@ void _unsafe_rollout_threaded(std::vector<const mjModel*>& m, std::vector<mjData
     auto task = [=, &m, &d](void) {
       _unsafe_rollout(m, d[pool->WorkerId()], nfulljobs*chunk_size,
         nfulljobs*chunk_size+chunk_remainder,
-        nstep, control_spec, state0, warmstart0, control, state, sensordata);
+        nstep, control_spec, state0, warmstart0, control0, control, state, sensordata, warmstart, nrepeat, ndomain);
     };
     pool->Schedule(task);
   }
@@ -247,14 +264,21 @@ class Rollout {
 
   void rollout(py::list m, py::list d, int nstep, unsigned int control_spec,
                const PyCArray state0, std::optional<const PyCArray> warmstart0,
+               std::optional<const PyCArray> control0,
                std::optional<const PyCArray> control,
                std::optional<const PyCArray> state,
                std::optional<const PyCArray> sensordata,
-               std::optional<int> chunk_size) {
+               std::optional<const PyCArray> warmstart,
+               std::optional<int> chunk_size,
+               int nrepeat, std::optional<int> ndomain) {
     // get raw pointers
     int nbatch = state0.shape(0);
-    std::vector<const raw::MjModel*> model_ptrs(nbatch);
-    for (int r = 0; r < nbatch; r++) {
+    int ndomain_final = nbatch;
+    if (ndomain.has_value()) {
+      ndomain_final = *ndomain;
+    }
+    std::vector<const raw::MjModel*> model_ptrs(ndomain_final);
+    for (int r = 0; r < ndomain_final; r++) {
       model_ptrs[r] = m[r].cast<const MjModelWrapper*>()->get();
     }
 
@@ -284,6 +308,9 @@ class Rollout {
     if (nstep < 1) {
       return;
     }
+    if (nrepeat < 1) {
+      return;
+    }
 
     // get sizes
     int nstate = mj_stateSize(model_ptrs[0], mjSTATE_FULLPHYSICS);
@@ -292,11 +319,15 @@ class Rollout {
     mjtNum* state0_ptr = get_array_ptr(state0, "state0", nbatch, 1, nstate);
     mjtNum* warmstart0_ptr =
         get_array_ptr(warmstart0, "warmstart0", nbatch, 1, model_ptrs[0]->nv);
+    mjtNum* control0_ptr =
+        get_array_ptr(control0, "control0", nbatch, 1, ncontrol);
     mjtNum* control_ptr =
         get_array_ptr(control, "control", nbatch, nstep, ncontrol);
     mjtNum* state_ptr = get_array_ptr(state, "state", nbatch, nstep, nstate);
     mjtNum* sensordata_ptr = get_array_ptr(sensordata, "sensordata", nbatch,
                                            nstep, model_ptrs[0]->nsensordata);
+
+    mjtNum* warmstart_ptr = get_array_ptr(warmstart, "warmstart", nbatch, nstep, model_ptrs[0]->nv);
 
     // perform rollouts
     {
@@ -313,12 +344,12 @@ class Rollout {
         }
         InterceptMjErrors(_unsafe_rollout_threaded)(
             model_ptrs, data_ptrs, nbatch, nstep, control_spec, state0_ptr,
-            warmstart0_ptr, control_ptr, state_ptr, sensordata_ptr,
-            this->pool_.get(), chunk_size_final);
+            warmstart0_ptr, control0_ptr, control_ptr, state_ptr, sensordata_ptr, warmstart_ptr,
+            this->pool_.get(), chunk_size_final, nrepeat, ndomain_final);
       } else {
         InterceptMjErrors(_unsafe_rollout)(
-            model_ptrs, data_ptrs[0], 0, nbatch, nstep, control_spec,
-            state0_ptr, warmstart0_ptr, control_ptr, state_ptr, sensordata_ptr);
+            model_ptrs, data_ptrs[0], 0, nbatch, nstep, control_spec, state0_ptr,
+            warmstart0_ptr, control0_ptr, control_ptr, state_ptr, sensordata_ptr, warmstart_ptr, nrepeat, ndomain_final);
       }
     }
   }
@@ -348,10 +379,14 @@ PYBIND11_MODULE(_rollout, pymodule) {
         py::arg("control_spec"),
         py::arg("state0"),
         py::arg("warmstart0") = py::none(),
+        py::arg("control0") = py::none(),
         py::arg("control")    = py::none(),
         py::arg("state")      = py::none(),
         py::arg("sensordata") = py::none(),
+        py::arg("warmstart") = py::none(),
         py::arg("chunk_size") = py::none(),
+        py::arg("nrepeat") = py::int_(1),
+        py::arg("ndomain") = py::none(),
         py::doc(rollout_doc));
 }
 
