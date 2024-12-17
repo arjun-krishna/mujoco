@@ -812,7 +812,7 @@ class MuJoCoRolloutTest(parameterized.TestCase):
     np.testing.assert_array_equal(state, state2)
     np.testing.assert_array_equal(sensordata, sensordata2)
 
-  def test_data_sizes(self):
+  def test_warmstarts_returned(self):
     model = mujoco.MjModel.from_xml_string(TEST_XML)
     nstate = mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_FULLPHYSICS)
     data = mujoco.MjData(model)
@@ -895,6 +895,56 @@ class MuJoCoRolloutTest(parameterized.TestCase):
         nstep=nstep,
     )
 
+    # take one step, save the state
+    state0 = np.zeros(nstate)
+    control = np.zeros(model.nu)
+    state1, _ = step(model, data, state0, control)
+
+    # save qacc_warmstart
+    initial_warmstart = data.qacc_warmstart.copy()
+
+    # take one more step (uses correct warmstart)
+    state2, _ = step(model, data, state1[0], control)
+    warmstarts = ensure_3d(data.qacc_warmstart.copy())
+
+    # take step using rollout, don't take warmstart into account
+    state, _ = rollout.rollout(model, data, state1[0], control)
+
+    # assert that stepping without warmstarts is not exact
+    np.testing.assert_raises(
+        AssertionError, np.testing.assert_array_equal, state, state2
+    )
+
+    # take step using rollout, take warmstart into account
+    state, _, ret_warmstarts = rollout.rollout(
+        model, data, state1, control, initial_warmstart=initial_warmstart, return_warmstart=True,
+    )
+
+    # assert exact equality
+    np.testing.assert_array_equal(state, np.expand_dims(state2, axis=0))
+    np.testing.assert_array_equal(ret_warmstarts, warmstarts)
+
+  @parameterized.parameters(ALL_MODELS.keys())
+  def test_multi_step_nrepeat(self, model_name):
+    model = mujoco.MjModel.from_xml_string(ALL_MODELS[model_name])
+    nstate = mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_FULLPHYSICS)
+    data = mujoco.MjData(model)
+
+    nroll = 5  # number of rollouts
+    nstep = 5  # number of steps
+    nrepeat = 10 # number of repeats
+
+    initial_state = np.random.randn(nroll, nstate)
+    control = np.random.randn(nroll, nstep, model.nu)
+
+    state, sensordata = rollout.rollout(model, data, initial_state, control, nrepeat=nrepeat)
+
+    mujoco.mj_resetData(model, data)
+    # interleave control repeat
+    control_repeat = np.repeat(control, nrepeat, axis=1)
+    py_state, py_sensordata = py_rollout(model, data, initial_state, control_repeat)
+    np.testing.assert_array_equal(state, py_state[:, nrepeat-1::nrepeat])
+    np.testing.assert_array_equal(sensordata, py_sensordata[:, nrepeat-1::nrepeat])
 
 # -------------- Python implementation of rollout functionality ----------------
 

@@ -58,9 +58,13 @@ class Rollout:
       skip_checks: bool = False,
       nstep: Optional[int] = None,
       initial_warmstart: Optional[npt.ArrayLike] = None,
+      initial_control: Optional[npt.ArrayLike] = None,
       state: Optional[npt.ArrayLike] = None,
       sensordata: Optional[npt.ArrayLike] = None,
+      warmstart: Optional[npt.ArrayLike] = None,
       chunk_size: Optional[int] = None,
+      nrepeat: int = 1,
+      return_warmstart: bool = False,
   ):
     """Rolls out open-loop trajectories from initial states, get subsequent state and sensor values.
 
@@ -81,18 +85,26 @@ class Rollout:
       nstep: Number of steps in rollouts (inferred if unspecified).
       initial_warmstart: Initial qfrc_warmstart array (optional).
         ([nbatch or 1] x nv)
+      initial_control: Initial control array (optional).
+        ([nbatch or 1] x ncontrol)
       state: State output array (optional).
         (nbatch x nstep x nstate)
       sensordata: Sensor data output array (optional).
         (nbatch x nstep x nsensordata)
+      warmstart: Warmstart output array (optional).
+        (nbatch x nstep x nv)
       chunk_size: Determines threadpool chunk size. If unspecified,
                   chunk_size = max(1, nbatch / (nthread * 10))
+      nrepeat: Number of sub-steps (mj_step) to take for each action in trajectory.
+      return_warmstart: Force return warmstart
 
     Returns:
       state:
         State output array, (nbatch x nstep x nstate).
       sensordata:
         Sensor data output array, (nbatch x nstep x nsensordata).
+      warmstart: 
+        Warmstart output array, (nbatch x nstep x nv)
 
     Raises:
       RuntimeError: rollout requested after thread pool shutdown.
@@ -115,16 +127,22 @@ class Rollout:
           control_spec,
           initial_state,
           initial_warmstart,
+          initial_control,
           control,
           state,
           sensordata,
+          warmstart,
           chunk_size,
+          nrepeat,
+          len(model),
       )
-      return state, sensordata
+      if return_warmstart:
+        return state, sensordata, warmstart
+      else:
+        return state, sensordata
 
     if not isinstance(model, mujoco.MjModel):
       model = list(model)
-
     # check control_spec
     if control_spec & ~mujoco.mjtState.mjSTATE_USER.value:
       raise ValueError('control_spec can only contain bits in mjSTATE_USER')
@@ -132,32 +150,38 @@ class Rollout:
     # check types
     if nstep and not isinstance(nstep, int):
       raise ValueError('nstep must be an integer')
+    if nrepeat and not isinstance(nrepeat, int):
+      raise ValueError('nrepeat must be an integer')
     if chunk_size and not isinstance(chunk_size, int):
       raise ValueError('chunk_size must be an integer')
     _check_must_be_numeric(
         initial_state=initial_state,
         initial_warmstart=initial_warmstart,
+        initial_control=initial_control,
         control=control,
         state=state,
         sensordata=sensordata,
+        warmstart=warmstart,
     )
 
     # check number of dimensions
     _check_number_of_dimensions(
-        2, initial_state=initial_state, initial_warmstart=initial_warmstart
+        2, initial_state=initial_state, initial_warmstart=initial_warmstart, initial_control=initial_control
     )
     _check_number_of_dimensions(
-        3, control=control, state=state, sensordata=sensordata
+        3, control=control, state=state, sensordata=sensordata, warmstart=warmstart
     )
 
     # ensure 2D, make contiguous, row-major (C ordering)
     initial_state = _ensure_2d(initial_state)
     initial_warmstart = _ensure_2d(initial_warmstart)
+    initial_control = _ensure_2d(initial_control)
 
     # ensure 3D, make contiguous, row-major (C ordering)
     control = _ensure_3d(control)
     state = _ensure_3d(state)
     sensordata = _ensure_3d(sensordata)
+    warmstart = _ensure_3d(warmstart)
 
     # infer nbatch, check for incompatibilities
     nbatch = _infer_dimension(
@@ -165,27 +189,24 @@ class Rollout:
         1,
         initial_state=initial_state,
         initial_warmstart=initial_warmstart,
+        initial_control=initial_control,
         control=control,
         state=state,
         sensordata=sensordata,
+        warmstart=warmstart,
     )
-    if isinstance(model, list) and nbatch == 1:
-      nbatch = len(model)
-
-    if isinstance(model, list) and len(model) > 1 and len(model) != nbatch:
-      raise ValueError(
-          f'nbatch inferred as {nbatch} but model is length {len(model)}'
-      )
-    elif not isinstance(model, list):
+    if not isinstance(model, list):
       model = [model]  # Use a length 1 list to simplify code below
 
     if not isinstance(data, list):
       data = [data]  # Use a length 1 list to simplify code below
 
+    ndomain = len(model)
     # infer nstep, check for incompatibilities
     nstep = _infer_dimension(
-        1, nstep or 1, control=control, state=state, sensordata=sensordata
+        1, nstep or 1, control=control, state=state, sensordata=sensordata, warmstart=warmstart
     )
+    assert nrepeat > 0, 'nrepeat must be positive'
 
     # get nstate/ncontrol/nv/nsensordata
     # check that they are equal across models
@@ -207,14 +228,14 @@ class Rollout:
 
     # check trailing dimensions
     _check_trailing_dimension(nstate, initial_state=initial_state, state=state)
-    _check_trailing_dimension(ncontrol, control=control)
-    _check_trailing_dimension(nv, initial_warmstart=initial_warmstart)
+    _check_trailing_dimension(ncontrol, control=control, initial_control=initial_control)
+    _check_trailing_dimension(nv, initial_warmstart=initial_warmstart, warmstart=warmstart)
     _check_trailing_dimension(nsensordata, sensordata=sensordata)
 
     # tile input arrays/lists if required (singleton expansion)
-    model = model * nbatch if len(model) == 1 else model
     initial_state = _tile_if_required(initial_state, nbatch)
     initial_warmstart = _tile_if_required(initial_warmstart, nbatch)
+    initial_control = _tile_if_required(initial_control, nbatch)
     control = _tile_if_required(control, nbatch, nstep)
 
     # allocate output if not provided
@@ -222,6 +243,8 @@ class Rollout:
       state = np.empty((nbatch, nstep, nstate))
     if sensordata is None:
       sensordata = np.empty((nbatch, nstep, nsensordata))
+    if warmstart is None:
+      warmstart = np.empty((nbatch, nstep, nv))
 
     # call rollout
     self.rollout_.rollout(
@@ -231,14 +254,21 @@ class Rollout:
         control_spec,
         initial_state,
         initial_warmstart,
+        initial_control,
         control,
         state,
         sensordata,
+        warmstart,
         chunk_size,
+        nrepeat,
+        ndomain,
     )
 
     # return outputs
-    return state, sensordata
+    if return_warmstart:
+      return state, sensordata, warmstart
+    else:
+      return state, sensordata
 
 
 persistent_rollout = None
@@ -268,10 +298,14 @@ def rollout(
     skip_checks: bool = False,
     nstep: Optional[int] = None,
     initial_warmstart: Optional[npt.ArrayLike] = None,
+    initial_control: Optional[npt.ArrayLike] = None,
     state: Optional[npt.ArrayLike] = None,
     sensordata: Optional[npt.ArrayLike] = None,
+    warmstart: Optional[npt.ArrayLike] = None,
     chunk_size: Optional[int] = None,
     persistent_pool: bool = False,
+    nrepeat: int = 1,
+    return_warmstart: bool = False,
 ):
   """Rolls out open-loop trajectories from initial states, get subsequent states and sensor values.
 
@@ -292,19 +326,27 @@ def rollout(
     nstep: Number of steps in rollouts (inferred if unspecified).
     initial_warmstart: Initial qfrc_warmstart array (optional).
       ([nbatch or 1] x nv)
+    initial_control: Initial control array (optional).
+      ([nbatch or 1] x ncontrol)
     state: State output array (optional).
       (nbatch x nstep x nstate)
     sensordata: Sensor data output array (optional).
       (nbatch x nstep x nsensordata)
+    warmstart: Warmstart output array (optional).
+      (nbatch x nstep x nv)
     chunk_size: Determines threadpool chunk size. If unspecified,
                 chunk_size = max(1, nbatch / (nthread * 10))
     persistent_pool: Determines if a persistent thread pool is created or reused.
+    nrepeat: Number of sub-steps (mj_step) to take for each action in trajectory.
+    return_warmstart: Force return warmstart
 
   Returns:
     state:
       State output array, (nbatch x nstep x nstate).
     sensordata:
       Sensor data output array, (nbatch x nstep x nsensordata).
+    warmstart:
+      Warmstart output array, (nbatch x nstep x nv)
 
   Raises:
     ValueError: bad shapes or sizes.
@@ -337,9 +379,13 @@ def rollout(
         skip_checks=skip_checks,
         nstep=nstep,
         initial_warmstart=initial_warmstart,
+        initial_control=initial_control,
         state=state,
         sensordata=sensordata,
+        warmstart=warmstart,
         chunk_size=chunk_size,
+        nrepeat=nrepeat,
+        return_warmstart=return_warmstart,
     )
   finally:
     if not persistent_pool:
